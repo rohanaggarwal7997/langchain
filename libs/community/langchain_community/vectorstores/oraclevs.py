@@ -1,3 +1,4 @@
+# OopCompanion:suppressRename
 from __future__ import annotations
 
 import array
@@ -23,7 +24,7 @@ from typing import (
 )
 
 if TYPE_CHECKING:
-    from oracledb import Connection
+    from oracledb import Connection, SessionPool
 
 import numpy as np
 from langchain_core.documents import Document
@@ -45,6 +46,49 @@ logging.basicConfig(
 
 # Define a type variable that can be any kind of function
 T = TypeVar("T", bound=Callable[..., Any])
+
+
+def _convert_oper_to_sql(oper: str) -> str:
+    oper_map = {"EQ": "==", "GT": ">", "LT": "<", "GTE": ">=", "LTE": "<="}
+    return oper_map.get(oper, "=")
+
+
+def _generate_where_clause(db_filter: List[Dict[str, str]]) -> str:
+    conditions = []
+    for condition in db_filter:
+        key = condition["key"]
+        oper = _convert_oper_to_sql(condition["oper"])
+        value = condition["value"]
+        if isinstance(value, str):
+            value = f'"{value}"'  # Enclose the value in double quotes
+        # Assuming oper is equality for now, adjust if needed
+        conditions.append(f"JSON_EXISTS(metadata, '$.{key}?(@ {oper} {value})')")
+    return " AND ".join(conditions)
+
+
+def _get_connection(client: Union[Connection, SessionPool]) -> Connection | None:
+    # Dynamically import oracledb and the required classes
+    try:
+        import oracledb
+    except ImportError as e:
+        raise ImportError(
+            "Unable to import oracledb, please install with "
+            "`pip install -U oracledb`."
+        ) from e
+
+    if not isinstance(client, (oracledb.Connection, oracledb.SessionPool)):
+        raise TypeError(
+            f"Expected client of type Connection | SessionPool, got "
+            f"{type(client).__name__}"
+        )
+
+    connection: Optional[oracledb.Connection]
+    is_session_pool = isinstance(client, oracledb.SessionPool)
+    if is_session_pool:
+        connection = client.acquire()
+    else:
+        connection = client
+    return connection
 
 
 def _handle_exceptions(func: T) -> T:
@@ -70,7 +114,7 @@ def _handle_exceptions(func: T) -> T:
     return cast(T, wrapper)
 
 
-def _table_exists(client: Connection, table_name: str) -> bool:
+def _table_exists(connection: Connection, table_name: str) -> bool:
     try:
         import oracledb
     except ImportError as e:
@@ -80,7 +124,7 @@ def _table_exists(client: Connection, table_name: str) -> bool:
         ) from e
 
     try:
-        with client.cursor() as cursor:
+        with connection.cursor() as cursor:
             cursor.execute(f"SELECT COUNT(*) FROM {table_name}")
             return True
     except oracledb.DatabaseError as ex:
@@ -107,7 +151,7 @@ def _compare_version(version: str, target_version: str) -> bool:
 
 
 @_handle_exceptions
-def _index_exists(client: Connection, index_name: str) -> bool:
+def _index_exists(connection: Connection, index_name: str) -> bool:
     # Check if the index exists
     query = """
         SELECT index_name 
@@ -115,7 +159,7 @@ def _index_exists(client: Connection, index_name: str) -> bool:
         WHERE upper(index_name) = upper(:idx_name)
         """
 
-    with client.cursor() as cursor:
+    with connection.cursor() as cursor:
         # Execute the query
         cursor.execute(query, idx_name=index_name.upper())
         result = cursor.fetchone()
@@ -147,16 +191,16 @@ def _get_index_name(base_name: str) -> str:
 
 
 @_handle_exceptions
-def _create_table(client: Connection, table_name: str, embedding_dim: int) -> None:
+def _create_table(connection: Connection, table_name: str, embedding_dim: int) -> None:
     cols_dict = {
         "id": "RAW(16) DEFAULT SYS_GUID() PRIMARY KEY",
         "text": "CLOB",
-        "metadata": "CLOB",
+        "metadata": "JSON",
         "embedding": f"vector({embedding_dim}, FLOAT32)",
     }
 
-    if not _table_exists(client, table_name):
-        with client.cursor() as cursor:
+    if not _table_exists(connection, table_name):
+        with connection.cursor() as cursor:
             ddl_body = ", ".join(
                 f"{col_name} {col_type}" for col_name, col_type in cols_dict.items()
             )
@@ -169,33 +213,45 @@ def _create_table(client: Connection, table_name: str, embedding_dim: int) -> No
 
 @_handle_exceptions
 def create_index(
-    client: Connection,
+    client: Union[Connection, SessionPool],
     vector_store: OracleVS,
     params: Optional[dict[str, Any]] = None,
 ) -> None:
+    connection = _get_connection(client)
+    if connection is None:
+        raise ValueError("Failed to acquire a connection.")
     if params:
         if params["idx_type"] == "HNSW":
             _create_hnsw_index(
-                client, vector_store.table_name, vector_store.distance_strategy, params
+                connection,
+                vector_store.table_name,
+                vector_store.distance_strategy,
+                params,
             )
         elif params["idx_type"] == "IVF":
             _create_ivf_index(
-                client, vector_store.table_name, vector_store.distance_strategy, params
+                connection,
+                vector_store.table_name,
+                vector_store.distance_strategy,
+                params,
             )
         else:
             _create_hnsw_index(
-                client, vector_store.table_name, vector_store.distance_strategy, params
+                connection,
+                vector_store.table_name,
+                vector_store.distance_strategy,
+                params,
             )
     else:
         _create_hnsw_index(
-            client, vector_store.table_name, vector_store.distance_strategy, params
+            connection, vector_store.table_name, vector_store.distance_strategy, params
         )
     return
 
 
 @_handle_exceptions
 def _create_hnsw_index(
-    client: Connection,
+    connection: Connection,
     table_name: str,
     distance_strategy: DistanceStrategy,
     params: Optional[dict[str, Any]] = None,
@@ -269,8 +325,8 @@ def _create_hnsw_index(
     ddl = ddl_assembly.format(**config)
 
     # Check if the index exists
-    if not _index_exists(client, config["idx_name"]):
-        with client.cursor() as cursor:
+    if not _index_exists(connection, config["idx_name"]):
+        with connection.cursor() as cursor:
             cursor.execute(ddl)
             logger.info("Index created successfully...")
     else:
@@ -279,7 +335,7 @@ def _create_hnsw_index(
 
 @_handle_exceptions
 def _create_ivf_index(
-    client: Connection,
+    connection: Connection,
     table_name: str,
     distance_strategy: DistanceStrategy,
     params: Optional[dict[str, Any]] = None,
@@ -341,8 +397,8 @@ def _create_ivf_index(
     ddl = ddl_assembly.format(**config)
 
     # Check if the index exists
-    if not _index_exists(client, config["idx_name"]):
-        with client.cursor() as cursor:
+    if not _index_exists(connection, config["idx_name"]):
+        with connection.cursor() as cursor:
             cursor.execute(ddl)
         logger.info("Index created successfully...")
     else:
@@ -350,10 +406,12 @@ def _create_ivf_index(
 
 
 @_handle_exceptions
-def drop_table_purge(client: Connection, table_name: str) -> None:
-    if _table_exists(client, table_name):
-        cursor = client.cursor()
-        with cursor:
+def drop_table_purge(client: Union[Connection, SessionPool], table_name: str) -> None:
+    connection = _get_connection(client)
+    if connection is None:
+        raise ValueError("Failed to acquire a connection.")
+    if _table_exists(connection, table_name):
+        with connection.cursor() as cursor:
             ddl = f"DROP TABLE {table_name} PURGE"
             cursor.execute(ddl)
         logger.info("Table dropped successfully...")
@@ -363,10 +421,15 @@ def drop_table_purge(client: Connection, table_name: str) -> None:
 
 
 @_handle_exceptions
-def drop_index_if_exists(client: Connection, index_name: str) -> None:
-    if _index_exists(client, index_name):
+def drop_index_if_exists(
+    client: Union[Connection, SessionPool], index_name: str
+) -> None:
+    connection = _get_connection(client)
+    if connection is None:
+        raise ValueError("Failed to acquire a connection.")
+    if _index_exists(connection, index_name):
         drop_query = f"DROP INDEX {index_name}"
-        with client.cursor() as cursor:
+        with connection.cursor() as cursor:
             cursor.execute(drop_query)
             logger.info(f"Index {index_name} has been dropped.")
     else:
@@ -399,7 +462,7 @@ class OracleVS(VectorStore):
 
     def __init__(
         self,
-        client: Connection,
+        client: Union[Connection, SessionPool],
         embedding_function: Union[
             Callable[[str], List[float]],
             Embeddings,
@@ -418,11 +481,14 @@ class OracleVS(VectorStore):
             ) from e
 
         self.insert_mode = "array"
+        connection = _get_connection(client)
+        if connection is None:
+            raise ValueError("Failed to acquire a connection.")
 
-        if client.thin is True:
+        if hasattr(connection, "thin") and connection.thin:
             if oracledb.__version__ == "2.1.0":
                 raise Exception(
-                    "Oracle DB python thin client driver version 2.1.0 not supported"
+                    "Oracle DB python thin client driver version 2.1.0 " "not supported"
                 )
             elif _compare_version(oracledb.__version__, "2.2.0"):
                 self.insert_mode = "clob"
@@ -467,8 +533,7 @@ class OracleVS(VectorStore):
             self.table_name = table_name
             self.distance_strategy = distance_strategy
             self.params = params
-
-            _create_table(client, table_name, embedding_dim)
+            _create_table(connection, table_name, embedding_dim)
         except oracledb.DatabaseError as db_err:
             logger.exception(f"Database error occurred while create table: {db_err}")
             raise RuntimeError(
@@ -586,13 +651,16 @@ class OracleVS(VectorStore):
                 )
             ]
 
-        with self.client.cursor() as cursor:
+        connection = _get_connection(self.client)
+        if connection is None:
+            raise ValueError("Failed to acquire a connection.")
+        with connection.cursor() as cursor:
             cursor.executemany(
                 f"INSERT INTO {self.table_name} (id, text, metadata, "
                 f"embedding) VALUES (:1, :2, :3, :4)",
                 docs,
             )
-            self.client.commit()
+            connection.commit()
         return processed_ids
 
     def similarity_search(
@@ -679,26 +747,43 @@ class OracleVS(VectorStore):
         else:
             embedding_arr = array.array("f", embedding)
 
-        query = f"""
-        SELECT id,
-          text,
-          metadata,
-          vector_distance(embedding, :embedding,
-          {_get_distance_function(self.distance_strategy)}) as distance
-        FROM {self.table_name}
-        ORDER BY distance
-        FETCH APPROX FIRST {k} ROWS ONLY
-        """
+        db_filter = kwargs.get("db_filter", None)
+        if db_filter is None:
+            query = f"""
+            SELECT id,
+              text,
+              metadata,
+              vector_distance(embedding, :embedding,
+              {_get_distance_function(self.distance_strategy)}) as distance
+            FROM {self.table_name}
+            ORDER BY distance
+            FETCH APPROX FIRST {k} ROWS ONLY
+            """
+        else:
+            where_clause = _generate_where_clause(db_filter)
+            query = f"""
+            SELECT id,
+              text,
+              metadata,
+              vector_distance(embedding, :embedding,
+              {_get_distance_function(self.distance_strategy)}) as distance
+            FROM {self.table_name}
+            WHERE {where_clause}
+            ORDER BY distance
+            FETCH APPROX FIRST {k} ROWS ONLY
+            """
+
         # Execute the query
-        with self.client.cursor() as cursor:
+        connection = _get_connection(self.client)
+        if connection is None:
+            raise ValueError("Failed to acquire a connection.")
+        with connection.cursor() as cursor:
             cursor.execute(query, embedding=embedding_arr)
             results = cursor.fetchall()
 
             # Filter results if filter is provided
             for result in results:
-                metadata = json.loads(
-                    self._get_clob_value(result[2]) if result[2] is not None else "{}"
-                )
+                metadata = dict(result[2]) if isinstance(result[2], dict) else {}
 
                 # Apply filtering based on the 'filter' dictionary
                 if filter:
@@ -743,27 +828,44 @@ class OracleVS(VectorStore):
 
         documents = []
 
-        query = f"""
-        SELECT id,
-          text,
-          metadata,
-          vector_distance(embedding, :embedding, {_get_distance_function(
-            self.distance_strategy)}) as distance,
-          embedding
-        FROM {self.table_name}
-        ORDER BY distance
-        FETCH APPROX FIRST {k} ROWS ONLY
-        """
+        db_filter = kwargs.get("db_filter", None)
+        if db_filter is None:
+            query = f"""
+            SELECT id,
+              text,
+              metadata,
+              vector_distance(embedding, :embedding, {_get_distance_function(
+                self.distance_strategy)}) as distance,
+              embedding
+            FROM {self.table_name}
+            ORDER BY distance
+            FETCH APPROX FIRST {k} ROWS ONLY
+            """
+        else:
+            where_clause = _generate_where_clause(db_filter)
+            query = f"""
+            SELECT id,
+              text,
+              metadata,
+              vector_distance(embedding, :embedding, {_get_distance_function(
+                self.distance_strategy)}) as distance, embedding
+            FROM {self.table_name}
+            WHERE {where_clause}
+            ORDER BY distance
+            FETCH APPROX FIRST {k} ROWS ONLY
+            """
 
         # Execute the query
-        with self.client.cursor() as cursor:
+        connection = _get_connection(self.client)
+        if connection is None:
+            raise ValueError("Failed to acquire a connection.")
+        with connection.cursor() as cursor:
             cursor.execute(query, embedding=embedding_arr)
             results = cursor.fetchall()
 
             for result in results:
                 page_content_str = self._get_clob_value(result[1])
-                metadata_str = self._get_clob_value(result[2])
-                metadata = json.loads(metadata_str)
+                metadata = result[2] if isinstance(result[2], dict) else {}
 
                 # Apply filter if provided and matches; otherwise, add all
                 # documents
@@ -956,9 +1058,12 @@ class OracleVS(VectorStore):
             f"id{i}": hashed_id for i, hashed_id in enumerate(hashed_ids, start=1)
         }
 
-        with self.client.cursor() as cursor:
+        connection = _get_connection(self.client)
+        if connection is None:
+            raise ValueError("Failed to acquire a connection.")
+        with connection.cursor() as cursor:
             cursor.execute(ddl, bind_vars)
-            self.client.commit()
+            connection.commit()
 
     @classmethod
     @_handle_exceptions
@@ -969,10 +1074,10 @@ class OracleVS(VectorStore):
         metadatas: Optional[List[dict]] = None,
         **kwargs: Any,
     ) -> OracleVS:
-        """Return VectorStore initialized from texts and embeddings."""
-        client = kwargs.get("client")
+        client: Optional[Union[Connection, SessionPool]] = kwargs.get("client", None)
         if client is None:
             raise ValueError("client parameter is required...")
+
         params = kwargs.get("params", {})
 
         table_name = str(kwargs.get("table_name", "langchain"))
