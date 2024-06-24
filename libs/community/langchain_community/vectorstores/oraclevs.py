@@ -24,7 +24,7 @@ from typing import (
 )
 
 if TYPE_CHECKING:
-    from oracledb import Connection, SessionPool
+    from oracledb import Connection
 
 import numpy as np
 from langchain_core.documents import Document
@@ -66,7 +66,7 @@ def _generate_where_clause(db_filter: List[Dict[str, str]]) -> str:
     return " AND ".join(conditions)
 
 
-def _get_connection(client: Union[Connection, SessionPool]) -> Connection | None:
+def _get_connection(client: Any) -> Connection | None:
     # Dynamically import oracledb and the required classes
     try:
         import oracledb
@@ -76,19 +76,20 @@ def _get_connection(client: Union[Connection, SessionPool]) -> Connection | None
             "`pip install -U oracledb`."
         ) from e
 
-    if not isinstance(client, (oracledb.Connection, oracledb.SessionPool)):
-        raise TypeError(
-            f"Expected client of type Connection | SessionPool, got "
-            f"{type(client).__name__}"
-        )
+    # check if ConnectionPool exists
+    connection_pool_class = getattr(oracledb, 'ConnectionPool', None)
 
-    connection: Optional[oracledb.Connection]
-    is_session_pool = isinstance(client, oracledb.SessionPool)
-    if is_session_pool:
-        connection = client.acquire()
+    if isinstance(client, oracledb.Connection):
+        return client
+    elif connection_pool_class and isinstance(client, connection_pool_class):
+        return client.acquire()
     else:
-        connection = client
-    return connection
+        valid_types = "oracledb.Connection"
+        if connection_pool_class:
+            valid_types += " or oracledb.ConnectionPool"
+        raise TypeError(
+            f"Expected client of type {valid_types}, got {type(client).__name__}"
+        )
 
 
 def _handle_exceptions(func: T) -> T:
@@ -213,7 +214,7 @@ def _create_table(connection: Connection, table_name: str, embedding_dim: int) -
 
 @_handle_exceptions
 def create_index(
-    client: Union[Connection, SessionPool],
+    client: Any,
     vector_store: OracleVS,
     params: Optional[dict[str, Any]] = None,
 ) -> None:
@@ -406,7 +407,7 @@ def _create_ivf_index(
 
 
 @_handle_exceptions
-def drop_table_purge(client: Union[Connection, SessionPool], table_name: str) -> None:
+def drop_table_purge(client: Any, table_name: str) -> None:
     connection = _get_connection(client)
     if connection is None:
         raise ValueError("Failed to acquire a connection.")
@@ -422,7 +423,7 @@ def drop_table_purge(client: Union[Connection, SessionPool], table_name: str) ->
 
 @_handle_exceptions
 def drop_index_if_exists(
-    client: Union[Connection, SessionPool], index_name: str
+    client: Any, index_name: str
 ) -> None:
     connection = _get_connection(client)
     if connection is None:
@@ -462,7 +463,7 @@ class OracleVS(VectorStore):
 
     def __init__(
         self,
-        client: Union[Connection, SessionPool],
+        client: Any,
         embedding_function: Union[
             Callable[[str], List[float]],
             Embeddings,
@@ -1074,7 +1075,7 @@ class OracleVS(VectorStore):
         metadatas: Optional[List[dict]] = None,
         **kwargs: Any,
     ) -> OracleVS:
-        client: Optional[Union[Connection, SessionPool]] = kwargs.get("client", None)
+        client: Any = kwargs.get("client", None)
         if client is None:
             raise ValueError("client parameter is required...")
 
