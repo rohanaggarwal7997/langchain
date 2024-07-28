@@ -61,7 +61,6 @@ def _generate_where_clause(db_filter: List[Dict[str, str]]) -> str:
         value = condition["value"]
         if isinstance(value, str):
             value = f'"{value}"'  # Enclose the value in double quotes
-        # Assuming oper is equality for now, adjust if needed
         conditions.append(f"JSON_EXISTS(metadata, '$.{key}?(@ {oper} {value})')")
     return " AND ".join(conditions)
 
@@ -639,16 +638,16 @@ class OracleVS(VectorStore):
         docs: List[Tuple[Any, Any, Any, Any]]
         if self.insert_mode == "clob":
             docs = [
-                (id_, text, json.dumps(metadata), json.dumps(embedding))
-                for id_, text, metadata, embedding in zip(
-                    processed_ids, texts, metadatas, embeddings
+                (id_, json.dumps(embedding), json.dumps(metadata), text)
+                for id_, embedding, metadata, text in zip(
+                    processed_ids, embeddings, metadatas, texts
                 )
             ]
         else:
             docs = [
-                (id_, text, json.dumps(metadata), array.array("f", embedding))
-                for id_, text, metadata, embedding in zip(
-                    processed_ids, texts, metadatas, embeddings
+                (id_, array.array("f", embedding), json.dumps(metadata), text)
+                for id_, embedding, metadata, text in zip(
+                    processed_ids, embeddings, metadatas, texts
                 )
             ]
 
@@ -657,8 +656,8 @@ class OracleVS(VectorStore):
             raise ValueError("Failed to acquire a connection.")
         with connection.cursor() as cursor:
             cursor.executemany(
-                f"INSERT INTO {self.table_name} (id, text, metadata, "
-                f"embedding) VALUES (:1, :2, :3, :4)",
+                f"INSERT INTO {self.table_name} (id, embedding, metadata, "
+                f"text) VALUES (:1, :2, :3, :4)",
                 docs,
             )
             connection.commit()
@@ -672,6 +671,7 @@ class OracleVS(VectorStore):
         **kwargs: Any,
     ) -> List[Document]:
         """Return docs most similar to query."""
+        embedding: Optional[List[float]] = None
         if isinstance(self.embedding_function, Embeddings):
             embedding = self.embedding_function.embed_query(query)
         documents = self.similarity_search_by_vector(
@@ -699,6 +699,7 @@ class OracleVS(VectorStore):
         **kwargs: Any,
     ) -> List[Tuple[Document, float]]:
         """Return docs most similar to query."""
+        embedding: Optional[List[float]] = None
         if isinstance(self.embedding_function, Embeddings):
             embedding = self.embedding_function.embed_query(query)
         docs_and_scores = self.similarity_search_by_vector_with_relevance_scores(
@@ -748,7 +749,7 @@ class OracleVS(VectorStore):
         else:
             embedding_arr = array.array("f", embedding)
 
-        db_filter = kwargs.get("db_filter", None)
+        db_filter: Optional[List[dict[str, str]]] = kwargs.get("db_filter", None)
         if db_filter is None:
             query = f"""
             SELECT id,
