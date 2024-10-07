@@ -48,21 +48,46 @@ logging.basicConfig(
 T = TypeVar("T", bound=Callable[..., Any])
 
 
+class FilterCondition(TypedDict):
+    key: str
+    oper: str
+    value: str
+
+class FilterGroup(TypedDict):
+    _and: List[Union[FilterCondition, 'FilterGroup']]  # Use _and instead of and
+    _or: List[Union[FilterCondition, 'FilterGroup']]   # Use _or instead of or
+
 def _convert_oper_to_sql(oper: str) -> str:
     oper_map = {"EQ": "==", "GT": ">", "LT": "<", "GTE": ">=", "LTE": "<="}
-    return oper_map.get(oper, "=")
+    return oper_map.get(oper, "==")
 
 
-def _generate_where_clause(db_filter: List[Dict[str, str]]) -> str:
-    conditions = []
-    for condition in db_filter:
-        key = condition["key"]
-        oper = _convert_oper_to_sql(condition["oper"])
-        value = condition["value"]
-        if isinstance(value, str):
-            value = f'"{value}"'  # Enclose the value in double quotes
-        conditions.append(f"JSON_EXISTS(metadata, '$.{key}?(@ {oper} {value})')")
-    return " AND ".join(conditions)
+def _validate_condition(condition: FilterCondition) -> None:
+    # FilterCondition is already typed, so validation can be omitted or simplified.
+    pass
+
+
+def _generate_condition(condition: FilterCondition) -> str:
+    key = condition["key"]
+    oper = _convert_oper_to_sql(condition["oper"])
+    value = condition["value"]
+    if isinstance(value, str):
+        value = f'"{value}"'  # Enclose the value in double quotes for SQL string literals
+    return f"JSON_EXISTS(metadata, '$.{key}?(@ {oper} {value})')"
+
+
+def _generate_where_clause(db_filter: Union[FilterCondition, FilterGroup]) -> str:
+    # Check if it's a FilterGroup with "_and"
+    if isinstance(db_filter, dict) and "_and" in db_filter:
+        and_conditions = [_generate_where_clause(cond) for cond in db_filter["_and"]]
+        return "(" + " AND ".join(and_conditions) + ")"
+    # Check if it's a FilterGroup with "_or"
+    elif isinstance(db_filter, dict) and "_or" in db_filter:
+        or_conditions = [_generate_where_clause(cond) for cond in db_filter["_or"]]
+        return "(" + " OR ".join(or_conditions) + ")"
+    # Otherwise, it's a base condition (FilterCondition)
+    else:
+        return _generate_condition(db_filter)
 
 
 def _get_connection(client: Any) -> Connection | None:
@@ -749,7 +774,7 @@ class OracleVS(VectorStore):
         else:
             embedding_arr = array.array("f", embedding)
 
-        db_filter: Optional[List[dict[str, str]]] = kwargs.get("db_filter", None)
+        db_filter: Optional[FilterGroup] = kwargs.get("db_filter", None)
         if db_filter is None:
             query = f"""
             SELECT id,
@@ -830,7 +855,7 @@ class OracleVS(VectorStore):
 
         documents = []
 
-        db_filter = kwargs.get("db_filter", None)
+        db_filter: Optional[FilterGroup] = kwargs.get("db_filter", None)
         if db_filter is None:
             query = f"""
             SELECT id,
