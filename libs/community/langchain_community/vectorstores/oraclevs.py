@@ -10,6 +10,7 @@ import os
 import uuid
 from typing import (
     TYPE_CHECKING,
+    TypedDict,
     Any,
     Callable,
     Dict,
