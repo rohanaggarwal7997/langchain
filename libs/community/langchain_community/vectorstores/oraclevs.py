@@ -1,3 +1,4 @@
+# OopCompanion:suppressRename
 from __future__ import annotations
 
 import array
@@ -17,6 +18,7 @@ from typing import (
     Optional,
     Tuple,
     Type,
+    TypedDict,
     TypeVar,
     Union,
     cast,
@@ -49,13 +51,62 @@ logging.basicConfig(
 T = TypeVar("T", bound=Callable[..., Any])
 
 
+class FilterCondition(TypedDict):
+    key: str
+    oper: str
+    value: str
+
+
+class FilterGroup(TypedDict, total=False):
+    _and: Optional[List[Union["FilterCondition", "FilterGroup"]]]
+    _or: Optional[List[Union["FilterCondition", "FilterGroup"]]]
+
+
+def _convert_oper_to_sql(oper: str) -> str:
+    oper_map = {"EQ": "==", "GT": ">", "LT": "<", "GTE": ">=", "LTE": "<="}
+    return oper_map.get(oper, "==")
+
+
+def _generate_condition(condition: FilterCondition) -> str:
+    key = condition["key"]
+    oper = _convert_oper_to_sql(condition["oper"])
+    value = condition["value"]
+    if isinstance(value, str):
+        value = f'"{value}"'
+    return f"JSON_EXISTS(metadata, '$.{key}?(@ {oper} {value})')"
+
+
+def _generate_where_clause(db_filter: Union[FilterCondition, FilterGroup]) -> str:
+    if "key" in db_filter:  # Identify as FilterCondition
+        return _generate_condition(cast(FilterCondition, db_filter))
+
+    if "_and" in db_filter and db_filter["_and"] is not None:
+        and_conditions = [
+            _generate_where_clause(cond)
+            for cond in db_filter["_and"]
+            if isinstance(cond, dict)
+        ]
+        return "(" + " AND ".join(and_conditions) + ")"
+
+    if "_or" in db_filter and db_filter["_or"] is not None:
+        or_conditions = [
+            _generate_where_clause(cond)
+            for cond in db_filter["_or"]
+            if isinstance(cond, dict)
+        ]
+        return "(" + " OR ".join(or_conditions) + ")"
+
+    raise ValueError(f"Invalid filter structure: {db_filter}")
+
+
 def _get_connection(client: Any) -> Connection | None:
     # Dynamically import oracledb and the required classes
     try:
         import oracledb
     except ImportError as e:
         raise ImportError(
-            "Unable to import oracledb, please install with `pip install -U oracledb`."
+            "Unable to import oracledb, please install with "
+            "`pip install -U oracledb`."
         ) from e
 
     # check if ConnectionPool exists
@@ -102,7 +153,8 @@ def _table_exists(connection: Connection, table_name: str) -> bool:
         import oracledb
     except ImportError as e:
         raise ImportError(
-            "Unable to import oracledb, please install with `pip install -U oracledb`."
+            "Unable to import oracledb, please install with "
+            "`pip install -U oracledb`."
         ) from e
 
     try:
@@ -205,28 +257,31 @@ def create_index(
     if params:
         if params["idx_type"] == "HNSW":
             _create_hnsw_index(
-                connection,
-                vector_store.table_name,
-                vector_store.distance_strategy,
-                params,
+                connection, 
+                vector_store.table_name, 
+                vector_store.distance_strategy, 
+                params
             )
         elif params["idx_type"] == "IVF":
             _create_ivf_index(
-                connection,
-                vector_store.table_name,
-                vector_store.distance_strategy,
-                params,
+                connection, 
+                vector_store.table_name, 
+                vector_store.distance_strategy, 
+                params
             )
         else:
             _create_hnsw_index(
-                connection,
-                vector_store.table_name,
-                vector_store.distance_strategy,
-                params,
+                connection, 
+                vector_store.table_name, 
+                vector_store.distance_strategy, 
+                params
             )
     else:
         _create_hnsw_index(
-            connection, vector_store.table_name, vector_store.distance_strategy, params
+            connection, 
+            vector_store.table_name, 
+            vector_store.distance_strategy, 
+            params
         )
     return
 
@@ -747,7 +802,9 @@ class OracleVS(VectorStore):
         else:
             embedding_arr = array.array("f", embedding)
 
-        query = f"""
+        db_filter: Optional[FilterGroup] = kwargs.get("db_filter", None)
+        if db_filter is None:
+            query = f"""
             SELECT id,
               text,
               metadata,
@@ -756,7 +813,20 @@ class OracleVS(VectorStore):
             FROM {self.table_name}
             ORDER BY distance
             FETCH APPROX FIRST {k} ROWS ONLY
-        """
+            """
+        else:
+            where_clause = _generate_where_clause(db_filter)
+            query = f"""
+            SELECT id,
+              text,
+              metadata,
+              vector_distance(embedding, :embedding,
+              {_get_distance_function(self.distance_strategy)}) as distance
+            FROM {self.table_name}
+            WHERE {where_clause}
+            ORDER BY distance
+            FETCH APPROX FIRST {k} ROWS ONLY
+            """
 
         # Execute the query
         connection = _get_connection(self.client)
@@ -813,18 +883,32 @@ class OracleVS(VectorStore):
 
         documents = []
 
-        query = f"""
+        db_filter: Optional[FilterGroup] = kwargs.get("db_filter", None)
+        if db_filter is None:
+            query = f"""
             SELECT id,
               text,
               metadata,
-              vector_distance(embedding, :embedding, {
-            _get_distance_function(self.distance_strategy)
-        }) as distance,
+              vector_distance(embedding, :embedding, {_get_distance_function(
+                self.distance_strategy)}) as distance,
               embedding
             FROM {self.table_name}
             ORDER BY distance
             FETCH APPROX FIRST {k} ROWS ONLY
-        """
+            """
+        else:
+            where_clause = _generate_where_clause(db_filter)
+            query = f"""
+            SELECT id,
+              text,
+              metadata,
+              vector_distance(embedding, :embedding, {_get_distance_function(
+                self.distance_strategy)}) as distance, embedding
+            FROM {self.table_name}
+            WHERE {where_clause}
+            ORDER BY distance
+            FETCH APPROX FIRST {k} ROWS ONLY
+            """
 
         # Execute the query
         connection = _get_connection(self.client)
@@ -1058,7 +1142,7 @@ class OracleVS(VectorStore):
         )
         if not isinstance(distance_strategy, DistanceStrategy):
             raise TypeError(
-                f"Expected DistanceStrategy got {type(distance_strategy).__name__} "
+                f"Expected DistanceStrategy got " f"{type(distance_strategy).__name__} "
             )
 
         query = kwargs.get("query", "What is a Oracle database")
